@@ -1,0 +1,138 @@
+name: 'Sync .NET Dependencies'
+description: 'Automatically syncs .NET project dependencies to Dockerfiles and GitHub workflow path filters'
+author: 'Likvido'
+
+inputs:
+  modified-files:
+    description: 'Comma-separated list of modified files. If not specified, will use git to detect changes or update all deployable projects.'
+    required: false
+    default: ''
+  base-ref:
+    description: 'Base git ref to compare against for detecting modified files (e.g., origin/main). If not specified and modified-files is empty, all deployable projects are updated.'
+    required: false
+    default: ''
+  repository-root:
+    description: 'Root directory of the repository. Defaults to GITHUB_WORKSPACE or current directory.'
+    required: false
+    default: ''
+
+outputs:
+  dockerfiles-updated:
+    description: 'Number of Dockerfiles that were updated'
+    value: ${{ steps.sync.outputs.dockerfiles-updated }}
+  workflows-updated:
+    description: 'Number of workflow files that were updated'
+    value: ${{ steps.sync.outputs.workflows-updated }}
+  dependencies-count:
+    description: 'Total number of dependencies processed'
+    value: ${{ steps.sync.outputs.dependencies-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check .NET SDK
+      shell: bash
+      run: |
+        if ! command -v dotnet &> /dev/null; then
+          echo "::error::.NET SDK is not installed. Please add 'actions/setup-dotnet@v4' with .NET 10 to your workflow before this action."
+          exit 1
+        fi
+
+        DOTNET_VERSION=$(dotnet --version | cut -d'.' -f1)
+        if [ "$DOTNET_VERSION" -lt 10 ]; then
+          echo "::error::.NET 10 or higher is required. Current version: $(dotnet --version)"
+          echo "::error::Please update your setup-dotnet action to use .NET 10"
+          exit 1
+        fi
+
+        echo "::notice::.NET SDK version: $(dotnet --version)"
+
+    - name: Detect Modified Files
+      id: detect
+      shell: bash
+      env:
+        INPUT_MODIFIED_FILES: ${{ inputs.modified-files }}
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        REPO_ROOT: ${{ inputs.repository-root }}
+      run: |
+        # Set repository root
+        if [ -z "$REPO_ROOT" ]; then
+          if [ -n "$GITHUB_WORKSPACE" ]; then
+            REPO_ROOT="$GITHUB_WORKSPACE"
+          else
+            REPO_ROOT="$(pwd)"
+          fi
+        fi
+        cd "$REPO_ROOT"
+
+        # If modified files are provided, use them directly
+        if [ -n "$INPUT_MODIFIED_FILES" ]; then
+          echo "Using provided modified files list"
+          echo "modified_files=$INPUT_MODIFIED_FILES" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # If base ref is provided, use git diff to detect changes
+        if [ -n "$INPUT_BASE_REF" ]; then
+          echo "Detecting modified files compared to $INPUT_BASE_REF"
+
+          # Fetch the base ref if needed
+          git fetch origin "$INPUT_BASE_REF" --depth=1 2>/dev/null || true
+
+          # Get modified files (csproj, sln, Directory.Build.props, Directory.Packages.props)
+          MODIFIED=$(git diff --name-only "$INPUT_BASE_REF" HEAD -- '*.csproj' '*.sln' '**/Directory.Build.props' '**/Directory.Packages.props' 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+
+          if [ -n "$MODIFIED" ]; then
+            echo "Detected modified files: $MODIFIED"
+            echo "modified_files=$MODIFIED" >> $GITHUB_OUTPUT
+          else
+            echo "No relevant files modified"
+            echo "modified_files=" >> $GITHUB_OUTPUT
+          fi
+          exit 0
+        fi
+
+        # No modified files specified and no base ref - will update all deployable projects
+        echo "No modified files or base ref specified - will analyze all deployable projects"
+        echo "modified_files=" >> $GITHUB_OUTPUT
+
+    - name: Sync Dependencies
+      id: sync
+      shell: bash
+      env:
+        MODIFIED_FILES: ${{ steps.detect.outputs.modified_files }}
+        REPO_ROOT: ${{ inputs.repository-root }}
+      run: |
+        # Set repository root
+        if [ -z "$REPO_ROOT" ]; then
+          if [ -n "$GITHUB_WORKSPACE" ]; then
+            REPO_ROOT="$GITHUB_WORKSPACE"
+          else
+            REPO_ROOT="$(pwd)"
+          fi
+        fi
+
+        # Build arguments
+        ARGS="--repo-root \"$REPO_ROOT\""
+
+        if [ -n "$MODIFIED_FILES" ]; then
+          ARGS="$ARGS --modified \"$MODIFIED_FILES\""
+        fi
+
+        # Run the sync script
+        echo "::group::Syncing dependencies"
+        cd "${{ github.action_path }}"
+        eval dotnet run sync-dependencies.cs -- $ARGS
+        SYNC_EXIT_CODE=$?
+        echo "::endgroup::"
+
+        if [ $SYNC_EXIT_CODE -ne 0 ]; then
+          echo "::error::Dependency sync failed with exit code $SYNC_EXIT_CODE"
+          exit $SYNC_EXIT_CODE
+        fi
+
+        echo "::notice::Dependency sync completed successfully"
+
+branding:
+  icon: 'refresh-cw'
+  color: 'blue'
