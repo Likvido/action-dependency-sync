@@ -96,7 +96,6 @@ on:
       - develop
     paths:
       - '**/*.csproj'
-      - '**/*.sln'
       - '**/Directory.Build.props'
       - '**/Directory.Packages.props'
 
@@ -200,7 +199,8 @@ Useful when integrating with other actions that detect file changes:
   with:
     files: |
       **/*.csproj
-      **/*.sln
+      **/Directory.Build.props
+      **/Directory.Packages.props
 
 - name: Sync Dependencies
   uses: Likvido/action-dependency-sync@v1
