@@ -131,8 +131,8 @@ jobs:
 
       - name: Commit Changes
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
+          git config --local user.email "your-bot[bot]@users.noreply.github.com"
+          git config --local user.name "Your Bot Name"
           git add -A
           git diff --staged --quiet || git commit -m "chore: sync project dependencies"
           git push
