@@ -33,6 +33,7 @@ If you add `NewLibrary.csproj` and reference it from `Library.csproj`:
 ## Prerequisites
 
 - .NET 10 SDK or higher must be available in your workflow
+- A GitHub App with `contents: write` and `workflows: write` permissions (because `GITHUB_TOKEN` cannot modify workflow files)
 
 ## Quick Start
 
@@ -102,15 +103,21 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      workflows: write  # Required because the action updates workflow files
 
     steps:
+      # GitHub App token required because GITHUB_TOKEN cannot modify workflow files
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.YOUR_APP_ID }}
+          private-key: ${{ secrets.YOUR_APP_PRIVATE_KEY }}
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Needed to compare with base branch
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
