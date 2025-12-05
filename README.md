@@ -134,7 +134,7 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add -A
-          git diff --staged --quiet || git commit -m "chore: sync project dependencies [skip ci]"
+          git diff --staged --quiet || git commit -m "chore: sync project dependencies"
           git push
 ```
 
