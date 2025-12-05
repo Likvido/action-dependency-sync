@@ -104,6 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      workflows: write  # Required because the action updates workflow files
 
     steps:
       - name: Checkout
