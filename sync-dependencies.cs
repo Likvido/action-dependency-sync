@@ -1157,6 +1157,9 @@ class RepositoryGraphBuilder
                 ? targetFrameworks.Split(';')
                 : new[] { targetFramework! };
 
+            bool hasModernFramework = false;
+            bool hasOnlyLegacyFrameworks = true;
+
             foreach (var fw in frameworks)
             {
                 if (string.IsNullOrEmpty(fw)) continue;
@@ -1166,17 +1169,24 @@ class RepositoryGraphBuilder
                     fw.StartsWith("net8.") || fw.StartsWith("net9.") || fw.StartsWith("net10.") ||
                     fw.StartsWith("netstandard") || fw.StartsWith("netcoreapp"))
                 {
-                    continue;
+                    hasModernFramework = true;
+                    hasOnlyLegacyFrameworks = false;
                 }
-
                 // Legacy frameworks
-                if (fw.StartsWith("net4") || fw.StartsWith("net3") || fw.StartsWith("net2"))
+                else if (fw.StartsWith("net4") || fw.StartsWith("net3") || fw.StartsWith("net2"))
                 {
-                    return true;
+                    // Legacy framework found, but don't return yet - check if there's also a modern one
+                }
+                else
+                {
+                    // Unknown framework, assume it's not legacy
+                    hasOnlyLegacyFrameworks = false;
                 }
             }
 
-            return false;
+            // Only mark as legacy if it has NO modern framework targets
+            // Multi-targeted projects (e.g., net8.0;net48) should be treated as modern
+            return !hasModernFramework && hasOnlyLegacyFrameworks;
         }
         catch
         {
