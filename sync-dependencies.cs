@@ -151,7 +151,7 @@ foreach (var deployableProject in affectedDeployables)
     if (workflowPath != null)
     {
         Console.WriteLine($"Updating workflow: {GetRelativePath(repoRoot, workflowPath)}");
-        var result = UpdateWorkflow(workflowPath, deployableProject, dependencies, repoRoot);
+        var result = UpdateWorkflow(workflowPath, deployableProject, dependencies, directoryBuildProps, directoryPackagesProps, repoRoot);
         if (result.Success)
         {
             Console.WriteLine("  ✓ Workflow updated successfully");
@@ -667,7 +667,8 @@ static (bool Success, string Message) UpdateDockerfileWithoutMarkers(string dock
     return (true, "");
 }
 
-static (bool Success, string Message) UpdateWorkflow(string workflowPath, string projectPath, HashSet<string> dependencies, string repoRoot)
+static (bool Success, string Message) UpdateWorkflow(string workflowPath, string projectPath, HashSet<string> dependencies,
+    string? directoryBuildProps, string? directoryPackagesProps, string repoRoot)
 {
     var content = File.ReadAllText(workflowPath);
     var beginMarker = "# BEGIN AUTO-GENERATED PATHS";
@@ -675,6 +676,9 @@ static (bool Success, string Message) UpdateWorkflow(string workflowPath, string
 
     // Collect unique directories for paths
     var uniquePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    // Collect individual files that should be tracked (not as directories with /**)
+    var individualFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
     // Add main project directory
     var projectDir = Path.GetDirectoryName(projectPath)!;
@@ -687,6 +691,20 @@ static (bool Success, string Message) UpdateWorkflow(string workflowPath, string
         var depDir = Path.GetDirectoryName(dep)!;
         var depRelativePath = GetRelativePath(repoRoot, depDir).Replace("\\", "/");
         uniquePaths.Add(depRelativePath);
+    }
+
+    // Add Directory.Build.props if exists
+    if (directoryBuildProps != null)
+    {
+        var propsRelativePath = GetRelativePath(repoRoot, directoryBuildProps).Replace("\\", "/");
+        individualFiles.Add(propsRelativePath);
+    }
+
+    // Add Directory.Packages.props if exists
+    if (directoryPackagesProps != null)
+    {
+        var propsRelativePath = GetRelativePath(repoRoot, directoryPackagesProps).Replace("\\", "/");
+        individualFiles.Add(propsRelativePath);
     }
 
     var workflowRelativePath = GetRelativePath(repoRoot, workflowPath).Replace("\\", "/");
@@ -714,10 +732,16 @@ static (bool Success, string Message) UpdateWorkflow(string workflowPath, string
             var sb = new StringBuilder();
             sb.AppendLine(beginMarker);
 
-            // Write sorted paths
+            // Write sorted directory paths (with /**)
             foreach (var path in uniquePaths.OrderBy(p => p))
             {
                 sb.AppendLine($"{indent}- \"{path}/**\"");
+            }
+
+            // Write individual files (Directory.Build.props, Directory.Packages.props)
+            foreach (var file in individualFiles.OrderBy(f => f))
+            {
+                sb.AppendLine($"{indent}- \"{file}\"");
             }
 
             // Add workflow file itself
@@ -736,7 +760,7 @@ static (bool Success, string Message) UpdateWorkflow(string workflowPath, string
     }
 
     // Strategy 2: Find and replace paths: sections without markers
-    var result = UpdateWorkflowWithoutMarkers(workflowPath, content, uniquePaths, workflowRelativePath);
+    var result = UpdateWorkflowWithoutMarkers(workflowPath, content, uniquePaths, individualFiles, workflowRelativePath);
     if (result.Success)
     {
         return (true, "Updated using pattern detection (no markers)");
@@ -745,7 +769,7 @@ static (bool Success, string Message) UpdateWorkflow(string workflowPath, string
     return (false, result.Message);
 }
 
-static (bool Success, string Message) UpdateWorkflowWithoutMarkers(string workflowPath, string content, HashSet<string> uniquePaths, string workflowRelativePath)
+static (bool Success, string Message) UpdateWorkflowWithoutMarkers(string workflowPath, string content, HashSet<string> uniquePaths, HashSet<string> individualFiles, string workflowRelativePath)
 {
     var lines = content.Split('\n').ToList();
     var modified = false;
@@ -814,6 +838,11 @@ static (bool Success, string Message) UpdateWorkflowWithoutMarkers(string workfl
                 foreach (var path in uniquePaths.OrderBy(p => p))
                 {
                     newPathLines.Add($"{itemIndent}- \"{path}/**\"");
+                }
+                // Add individual files (Directory.Build.props, Directory.Packages.props)
+                foreach (var file in individualFiles.OrderBy(f => f))
+                {
+                    newPathLines.Add($"{itemIndent}- \"{file}\"");
                 }
                 newPathLines.Add($"{itemIndent}- \"{workflowRelativePath}\"");
 
