@@ -985,19 +985,10 @@ class RepositoryGraphBuilder
                         continue;
                     }
 
-                    var projectName = Path.GetFileNameWithoutExtension(projectPath);
-
-                    // Skip test projects
-                    if (projectName.Contains(".Test", StringComparison.OrdinalIgnoreCase) ||
-                        projectName.Contains("Tests", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
                     // Check for legacy projects
                     if (IsLegacyFrameworkProject(projectPath))
                     {
-                        Console.WriteLine($"    ::warning::Skipping legacy project: {projectName}");
+                        Console.WriteLine($"    ::warning::Skipping legacy project: {Path.GetFileNameWithoutExtension(projectPath)}");
                         continue;
                     }
 
@@ -1024,15 +1015,6 @@ class RepositoryGraphBuilder
 
                 foreach (var refPath in references)
                 {
-                    var refName = Path.GetFileNameWithoutExtension(refPath);
-
-                    // Skip test project references
-                    if (refName.Contains(".Test", StringComparison.OrdinalIgnoreCase) ||
-                        refName.Contains("Tests", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
                     // Only add if it's a known project
                     if (allProjects.Contains(refPath))
                     {
