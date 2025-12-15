@@ -338,17 +338,46 @@ static string? FindWorkflowFile(string projectPath, string repoRoot)
 
     var projectName = Path.GetFileNameWithoutExtension(projectPath);
     var projectRelativePath = GetRelativePath(repoRoot, projectPath).Replace("\\", "/");
+    var projectDir = Path.GetDirectoryName(projectRelativePath)?.Replace("\\", "/") ?? "";
+
+    // Collect all potential matches with their specificity score
+    var matches = new List<(string workflow, int score)>();
 
     foreach (var workflow in Directory.GetFiles(workflowDir, "*.yml").Concat(Directory.GetFiles(workflowDir, "*.yaml")))
     {
         var content = File.ReadAllText(workflow);
-        if (content.Contains(projectRelativePath) || content.Contains(projectName))
+        var score = 0;
+
+        // Highest priority: exact project path match
+        if (content.Contains(projectRelativePath))
         {
-            return workflow;
+            score = 100;
+        }
+        // High priority: project directory path match (e.g., "src/Likvido.CampaignRunnerScheduler/")
+        else if (!string.IsNullOrEmpty(projectDir) && content.Contains(projectDir + "/"))
+        {
+            score = 90;
+        }
+        // Medium priority: project name with word boundary (not a substring of another name)
+        // Use regex to ensure the project name is not part of a longer name
+        else
+        {
+            // Match projectName followed by non-alphanumeric or end (to avoid CampaignRunner matching CampaignRunnerScheduler)
+            var exactNamePattern = new Regex($@"{Regex.Escape(projectName)}(?![A-Za-z0-9])", RegexOptions.IgnoreCase);
+            if (exactNamePattern.IsMatch(content))
+            {
+                score = 50;
+            }
+        }
+
+        if (score > 0)
+        {
+            matches.Add((workflow, score));
         }
     }
 
-    return null;
+    // Return the best match (highest score)
+    return matches.OrderByDescending(m => m.score).FirstOrDefault().workflow;
 }
 
 static string? FindFileInHierarchy(string startDir, string fileName, string repoRoot)
