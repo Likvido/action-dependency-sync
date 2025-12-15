@@ -129,12 +129,15 @@ foreach (var deployableProject in affectedDeployables)
         Console.WriteLine($"Found Directory.Packages.props: {GetRelativePath(repoRoot, directoryPackagesProps)}");
     }
 
-    // Update Dockerfile
+    // Find workflow file first (needed for docker context detection)
+    var workflowPath = FindWorkflowFile(deployableProject, repoRoot);
+
+    // Update Dockerfile (pass workflow path for docker context extraction)
     var dockerfilePath = FindDockerfile(projectDir, repoRoot);
     if (dockerfilePath != null)
     {
         Console.WriteLine($"\nUpdating Dockerfile: {GetRelativePath(repoRoot, dockerfilePath)}");
-        var result = UpdateDockerfile(dockerfilePath, deployableProject, dependencies, directoryBuildProps, directoryPackagesProps, repoRoot);
+        var result = UpdateDockerfile(dockerfilePath, deployableProject, dependencies, directoryBuildProps, directoryPackagesProps, repoRoot, workflowPath);
         if (result.Success)
         {
             Console.WriteLine("  ✓ Dockerfile updated successfully");
@@ -147,7 +150,6 @@ foreach (var deployableProject in affectedDeployables)
     }
 
     // Update workflow file
-    var workflowPath = FindWorkflowFile(deployableProject, repoRoot);
     if (workflowPath != null)
     {
         Console.WriteLine($"Updating workflow: {GetRelativePath(repoRoot, workflowPath)}");
@@ -396,8 +398,48 @@ static string AppendDirectorySeparator(string path)
     return path;
 }
 
+static string? ExtractDockerContextFromWorkflow(string? workflowPath, string repoRoot)
+{
+    if (workflowPath == null || !File.Exists(workflowPath))
+    {
+        return null;
+    }
+
+    var content = File.ReadAllText(workflowPath);
+
+    // Look for docker-working-directory in various formats:
+    // docker-working-directory: src
+    // docker-working-directory: 'src'
+    // docker-working-directory: "src"
+    var patterns = new[]
+    {
+        @"docker-working-directory:\s*['""]?([^'""#\n\r]+?)['""]?\s*(?:#|$|\n|\r)",
+        @"DOCKER_WORKING_DIRECTORY:\s*['""]?([^'""#\n\r]+?)['""]?\s*(?:#|$|\n|\r)"
+    };
+
+    foreach (var pattern in patterns)
+    {
+        var regex = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.Multiline);
+        var match = regex.Match(content);
+        if (match.Success)
+        {
+            var contextDir = match.Groups[1].Value.Trim();
+            if (!string.IsNullOrEmpty(contextDir))
+            {
+                var fullPath = Path.Combine(repoRoot, contextDir);
+                if (Directory.Exists(fullPath))
+                {
+                    return Path.GetFullPath(fullPath);
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
 static (bool Success, string Message) UpdateDockerfile(string dockerfilePath, string projectPath, HashSet<string> dependencies,
-    string? directoryBuildProps, string? directoryPackagesProps, string repoRoot)
+    string? directoryBuildProps, string? directoryPackagesProps, string repoRoot, string? workflowPath = null)
 {
     var content = File.ReadAllText(dockerfilePath);
     var beginMarker = "# BEGIN AUTO-GENERATED PROJECT REFERENCES";
@@ -410,12 +452,20 @@ static (bool Success, string Message) UpdateDockerfile(string dockerfilePath, st
     // This is what docker build uses as the context when building
     var dockerContext = Path.GetDirectoryName(dockerfilePath)!;
 
-    // However, in many setups, the context is a parent directory (where the solution is)
-    // We detect this by looking at the existing COPY paths in the Dockerfile
-    var detectedContext = DetectDockerContext(content, dockerfilePath, repoRoot);
-    if (detectedContext != null)
+    // Priority 1: Try to extract docker context from the workflow file (most reliable)
+    var workflowContext = ExtractDockerContextFromWorkflow(workflowPath, repoRoot);
+    if (workflowContext != null)
     {
-        dockerContext = detectedContext;
+        dockerContext = workflowContext;
+    }
+    else
+    {
+        // Priority 2: Detect from existing COPY paths in the Dockerfile
+        var detectedContext = DetectDockerContext(content, dockerfilePath, repoRoot);
+        if (detectedContext != null)
+        {
+            dockerContext = detectedContext;
+        }
     }
 
     // Generate the new COPY statements
