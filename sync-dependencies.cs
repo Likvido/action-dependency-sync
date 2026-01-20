@@ -27,7 +27,7 @@ Console.WriteLine($"Repository Root: {repoRoot}");
 var solutions = FindSolutions(repoRoot);
 if (solutions.Count == 0)
 {
-    Console.WriteLine("::error::No .sln files found in repository");
+    Console.WriteLine("::error::No .sln or .slnx files found in repository");
     return 1;
 }
 
@@ -182,7 +182,10 @@ return 0;
 
 static List<string> FindSolutions(string repoRoot)
 {
-    return Directory.GetFiles(repoRoot, "*.sln", SearchOption.AllDirectories)
+    var slnFiles = Directory.GetFiles(repoRoot, "*.sln", SearchOption.AllDirectories);
+    var slnxFiles = Directory.GetFiles(repoRoot, "*.slnx", SearchOption.AllDirectories);
+
+    return slnFiles.Concat(slnxFiles)
         .Where(s => !s.Contains("/bin/") && !s.Contains("/obj/") && !s.Contains("\\bin\\") && !s.Contains("\\obj\\"))
         .ToList();
 }
@@ -1154,6 +1157,26 @@ class RepositoryGraphBuilder
     {
         var projects = new List<string>();
         var solutionDir = Path.GetDirectoryName(solutionPath)!;
+
+        // Handle .slnx files (XML format)
+        if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
+        {
+            var doc = XDocument.Load(solutionPath);
+            var projectElements = doc.Descendants("Project")
+                .Select(e => e.Attribute("Path")?.Value)
+                .Where(p => p != null && p.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase));
+
+            foreach (var relativePath in projectElements)
+            {
+                var normalizedPath = relativePath!.Replace("\\", Path.DirectorySeparatorChar.ToString());
+                var fullPath = Path.GetFullPath(Path.Combine(solutionDir, normalizedPath));
+                projects.Add(fullPath);
+            }
+
+            return projects;
+        }
+
+        // Handle .sln files (text format)
         var content = File.ReadAllText(solutionPath);
 
         // Match project references in solution file
