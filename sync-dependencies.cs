@@ -1162,8 +1162,10 @@ class RepositoryGraphBuilder
         if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
         {
             var doc = XDocument.Load(solutionPath);
-            var projectElements = doc.Descendants("Project")
-                .Select(e => e.Attribute("Path")?.Value)
+            // Use LocalName to handle namespaced elements
+            var projectElements = doc.Descendants()
+                .Where(e => e.Name.LocalName == "Project")
+                .Select(e => e.Attributes().FirstOrDefault(a => a.Name.LocalName == "Path")?.Value)
                 .Where(p => p != null && p.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase));
 
             foreach (var relativePath in projectElements)
