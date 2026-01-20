@@ -996,7 +996,7 @@ Examples:
   dotnet run sync-dependencies.cs -- --repo-root /path/to/repo
 
 How it works:
-  1. Discovers all .sln files in the repository
+  1. Discovers all .sln and .slnx files in the repository
   2. Builds a complete dependency graph by parsing .csproj files
   3. Finds all 'deployable' projects (those with Dockerfiles)
   4. Determines which projects were modified
