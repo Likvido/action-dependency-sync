@@ -19,7 +19,7 @@ If you add `NewLibrary.csproj` and reference it from `Library.csproj`:
 ## Features
 
 - **Smart dependency detection** - Finds all deployable projects affected by changes, including transitive dependencies
-- **Repository-wide analysis** - Scans all `.sln` files to build a complete dependency graph
+- **Repository-wide analysis** - Scans all `.sln or .slnx` files to build a complete dependency graph
 - **Dockerfile updates** - Generates COPY statements for all project references
 - **Workflow path updates** - Generates path filters for efficient CI/CD triggering
 - **Automatic detection** - Works without markers by detecting patterns in files
@@ -142,7 +142,7 @@ jobs:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ 1. Discover all .sln files in repository                        │
+│ 1. Discover all .sln or .slnx files in repository               │
 ├─────────────────────────────────────────────────────────────────┤
 │ 2. Build complete dependency graph by parsing .csproj files     │
 ├─────────────────────────────────────────────────────────────────┤
@@ -334,9 +334,9 @@ The action supports modern .NET (5.0+) projects only. Legacy .NET Framework proj
 
 Your project graph contains a circular reference. The error message will show the cycle path. Review your project references and remove the cycle.
 
-### Error: No .sln files found
+### Error: No .sln or .slnx files found
 
-Ensure your repository contains at least one `.sln` file. The action uses solution files to discover projects.
+Ensure your repository contains at least one `.sln or .slnx` file. The action uses solution files to discover projects.
 
 ### No deployable projects found
 
@@ -352,7 +352,7 @@ If using `base-ref`, ensure:
 
 The action uses:
 - **.NET 10 file-based scripting** - No project file needed, self-contained script
-- **Direct XML parsing** - Parses `.sln` and `.csproj` files directly for dependency analysis
+- **Direct XML parsing** - Parses `.sln or .slnx` and `.csproj` files directly for dependency analysis
 - **Zero external dependencies** - No NuGet packages required, uses only .NET BCL
 - **Hybrid detection** - Supports both explicit markers and automatic pattern detection
 - **Smart Docker context detection** - Automatically detects the Docker build context from existing COPY statements to generate correct relative paths
