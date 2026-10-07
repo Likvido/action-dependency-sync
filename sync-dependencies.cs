@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
@@ -51,7 +52,8 @@ if (!graphResult.Success)
 Console.WriteLine($"Found {graphResult.AllProjects.Count} projects in repository");
 
 // Step 3: Find all deployable projects (projects with Dockerfiles)
-var deployableProjects = FindDeployableProjects(graphResult.AllProjects, repoRoot);
+var testProjects = graphResult.AllProjects.Where(IsTestProject).ToHashSet(StringComparer.OrdinalIgnoreCase);
+var deployableProjects = FindDeployableProjects(graphResult.AllProjects.Where(p => !testProjects.Contains(p)).ToList(), repoRoot);
 Console.WriteLine($"Found {deployableProjects.Count} deployable project(s) with Dockerfiles");
 
 if (deployableProjects.Count == 0)
@@ -94,6 +96,28 @@ if (affectedDeployables.Count == 0)
     return 0;
 }
 
+// Path filter entries this action generates for any workflow: the directories of every project except the
+// test side of the solution, whose entries are written by hand. Together with the deployable's own props files
+// and stale entries (see IsGeneratedPathEntry), anything else in a paths list is left alone.
+var testSide = FindTestSide(graphResult.AllProjects, testProjects, deployableProjects, graphResult.DependencyGraph, repoRoot);
+var generatedEntries = graphResult.AllProjects
+    .Where(p => !testSide.Contains(p))
+    .Select(p => GetRelativePath(repoRoot, Path.GetDirectoryName(p)!).Replace("\\", "/") + "/**")
+    .ToHashSet(StringComparer.Ordinal);
+
+var deployableDockerfiles = deployableProjects
+    .ToDictionary(p => p, p => FindDockerfile(Path.GetDirectoryName(p)!, repoRoot)!, StringComparer.OrdinalIgnoreCase);
+var workflowDockerfiles = FindWorkflowDockerfiles(repoRoot);
+var workflowOwners = AssignWorkflowOwners(workflowDockerfiles, deployableDockerfiles, repoRoot);
+foreach (var (workflow, dockerfile) in workflowDockerfiles)
+{
+    if (!deployableDockerfiles.ContainsValue(dockerfile) &&
+        Regex.IsMatch(File.ReadAllText(dockerfile), @"\bdotnet\s+(restore|build|publish)\b", RegexOptions.IgnoreCase))
+    {
+        Console.WriteLine($"::warning::{GetRelativePath(repoRoot, workflow)} builds {GetRelativePath(repoRoot, dockerfile)}, but no project it publishes could be identified");
+    }
+}
+
 // Step 6: Update Dockerfiles and workflows for affected projects
 var dockerfilesUpdated = 0;
 var workflowsUpdated = 0;
@@ -129,12 +153,23 @@ foreach (var deployableProject in affectedDeployables)
         Console.WriteLine($"Found Directory.Packages.props: {GetRelativePath(repoRoot, directoryPackagesProps)}");
     }
 
-    // Find workflow file first (needed for docker context detection)
-    var workflowPath = FindWorkflowFile(deployableProject, repoRoot);
+    var dockerfilePath = FindDockerfile(projectDir, repoRoot);
+
+    // Find workflow files first (needed for docker context detection)
+    var workflowPaths = FindWorkflowFiles(deployableProject, workflowOwners, repoRoot);
+    if (workflowPaths.Count == 0)
+    {
+        Console.WriteLine($"  ::warning::No workflow found for {Path.GetFileNameWithoutExtension(deployableProject)}; its path filters are not updated");
+    }
+    var workflowPath = workflowPaths.FirstOrDefault();
 
     // Update Dockerfile (pass workflow path for docker context extraction)
-    var dockerfilePath = FindDockerfile(projectDir, repoRoot);
-    if (dockerfilePath != null)
+    if (dockerfilePath != null && RestoresWholeSolution(dockerfilePath))
+    {
+        // A solution-wide restore needs every project the solution names, not just this project's dependencies.
+        Console.WriteLine($"\nSkipping Dockerfile: {GetRelativePath(repoRoot, dockerfilePath)} restores a whole solution, so its COPY block is not generated");
+    }
+    else if (dockerfilePath != null)
     {
         Console.WriteLine($"\nUpdating Dockerfile: {GetRelativePath(repoRoot, dockerfilePath)}");
         var result = UpdateDockerfile(dockerfilePath, deployableProject, dependencies, directoryBuildProps, directoryPackagesProps, repoRoot, workflowPath);
@@ -149,11 +184,11 @@ foreach (var deployableProject in affectedDeployables)
         }
     }
 
-    // Update workflow file
-    if (workflowPath != null)
+    // Update workflow files
+    foreach (var workflowFile in workflowPaths)
     {
-        Console.WriteLine($"Updating workflow: {GetRelativePath(repoRoot, workflowPath)}");
-        var result = UpdateWorkflow(workflowPath, deployableProject, dependencies, directoryBuildProps, directoryPackagesProps, repoRoot);
+        Console.WriteLine($"Updating workflow: {GetRelativePath(repoRoot, workflowFile)}");
+        var result = UpdateWorkflow(workflowFile, deployableProject, dependencies, directoryBuildProps, directoryPackagesProps, repoRoot, generatedEntries);
         if (result.Success)
         {
             Console.WriteLine("  ✓ Workflow updated successfully");
@@ -197,12 +232,234 @@ static List<string> FindDeployableProjects(List<string> allProjects, string repo
     {
         var projectDir = Path.GetDirectoryName(project)!;
         var dockerfile = FindDockerfile(projectDir, repoRoot);
-        if (dockerfile != null)
+        if (dockerfile == null)
+        {
+            continue;
+        }
+
+        // A Dockerfile in a parent directory belongs to every project below it only by accident of layout.
+        // It makes this project deployable only when it publishes this project.
+        if (Path.GetDirectoryName(dockerfile)!.Equals(projectDir, StringComparison.OrdinalIgnoreCase) ||
+            DockerfilePublishesProject(dockerfile, project))
         {
             deployable.Add(project);
         }
     }
     return deployable;
+}
+
+static bool RestoresWholeSolution(string dockerfilePath)
+{
+    var content = File.ReadAllText(dockerfilePath);
+    if (content.Contains("# BEGIN AUTO-GENERATED PROJECT REFERENCES"))
+    {
+        return false;
+    }
+    return content.Split('\n')
+        .Select(line => line.Trim())
+        .Any(line => line.StartsWith("RUN", StringComparison.OrdinalIgnoreCase) &&
+                     Regex.IsMatch(line, @"dotnet\s+restore\b[^\n]*\.slnx?\b", RegexOptions.IgnoreCase));
+}
+
+// Whether the image the Dockerfile builds publishes the project: a "dotnet publish" naming the .csproj in the
+// final stage or a stage it is built FROM or copies --from. The deployment pipeline builds the final stage, so a
+// publish in any other stage (a test or tooling stage) does not end up in the deployed image.
+static bool DockerfilePublishesProject(string dockerfilePath, string projectPath)
+{
+    var projectFileName = Path.GetFileName(projectPath);
+    var publishProjectPattern = new Regex(
+        $@"\bdotnet\s+publish\b[^;&|\n]*?(?<![A-Za-z0-9_.-]){Regex.Escape(projectFileName)}(?![A-Za-z0-9_.-])",
+        RegexOptions.IgnoreCase);
+
+    // An exec-form RUN ["dotnet", "publish", ...] is read as the command line it runs. A ; & or | inside quotes,
+    // as in -p:DefineConstants="A;B", does not end the shell command.
+    return FinalImageInstructions(dockerfilePath)
+        .Select(instruction => ExecFormArguments(instruction) is { } arguments ? ExecFormCommandLine(arguments) : instruction)
+        .Select(instruction => Regex.Replace(instruction, @"""[^""]*""|'[^']*'", quoted => Regex.Replace(quoted.Value, "[;&|]", " ")))
+        .Any(instruction => publishProjectPattern.IsMatch(instruction));
+}
+
+// An exec-form RUN has no shell, so ; & | inside an argument are literal. A shell started in exec form
+// (["sh", "-c", "a && b"], or a flag cluster such as "-ec") runs its script, which is read as a shell command
+// line, one line per newline in it.
+static string ExecFormCommandLine(List<string> arguments)
+{
+    var isShell = arguments.Count > 1 && Path.GetFileName(arguments[0]) is "sh" or "bash" or "ash" or "dash" or "zsh";
+    var scriptIndex = isShell ? arguments.FindIndex(1, argument => Regex.IsMatch(argument, "^-[A-Za-z]*c[A-Za-z]*$")) + 1 : 0;
+    if (isShell && scriptIndex > 0 && scriptIndex < arguments.Count)
+    {
+        return arguments[scriptIndex];
+    }
+    return string.Join(" ", arguments.Select(argument => Regex.Replace(argument, "[;&|\r\n]", " ")));
+}
+
+// The arguments of an exec-form RUN, or null for shell form. As in Docker, a RUN is exec form only when its
+// command is a JSON array of strings; anything else, such as RUN [ -f x ], is shell form.
+static List<string>? ExecFormArguments(string instruction)
+{
+    var exec = Regex.Match(instruction, @"^RUN\s+(?:--\S+\s+)*(\[.*\])\s*$", RegexOptions.IgnoreCase);
+    if (!exec.Success)
+    {
+        return null;
+    }
+    try
+    {
+        using var document = JsonDocument.Parse(exec.Groups[1].Value);
+        var elements = document.RootElement.EnumerateArray().ToList();
+        return elements.Count > 0 && elements.All(e => e.ValueKind == JsonValueKind.String)
+            ? elements.Select(e => e.GetString()!).ToList()
+            : null;
+    }
+    catch (Exception e) when (e is JsonException or InvalidOperationException)
+    {
+        // Not valid JSON, or a string .NET cannot decode (such as a lone surrogate): read it as shell form.
+        return null;
+    }
+}
+
+static List<string> FinalImageInstructions(string dockerfilePath)
+{
+    // Drop comment lines first, as Docker does, then join "\" continuation lines so an instruction split over
+    // several lines is one line. Heredoc bodies stay as separate lines in their stage.
+    var withoutComments = string.Join("\n", File.ReadAllText(dockerfilePath).Split('\n')
+        .Where(line => !line.TrimStart().StartsWith("#")));
+    var instructions = Regex.Replace(withoutComments, @"\\[ \t]*\r?\n", " ")
+        .Split('\n')
+        .Select(line => line.Trim())
+        .Where(line => line.Length > 0)
+        .ToList();
+
+    var stages = new List<(string? Name, string Base, List<string> Instructions)>();
+    foreach (var instruction in instructions)
+    {
+        var from = Regex.Match(instruction, @"^FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", RegexOptions.IgnoreCase);
+        if (from.Success)
+        {
+            stages.Add((from.Groups[2].Success ? from.Groups[2].Value : null, from.Groups[1].Value, new List<string>()));
+        }
+        else if (stages.Count > 0)
+        {
+            stages[^1].Instructions.Add(instruction);
+        }
+    }
+    if (stages.Count == 0)
+    {
+        return instructions;
+    }
+
+    int? FindStage(string reference) =>
+        int.TryParse(reference, out var index) && index >= 0 && index < stages.Count ? index
+        : stages.FindIndex(st => st.Name != null && st.Name.Equals(reference, StringComparison.OrdinalIgnoreCase)) is var i && i >= 0 ? i
+        : null;
+
+    var included = new HashSet<int>();
+    var queue = new Queue<int>();
+    queue.Enqueue(stages.Count - 1);
+    while (queue.Count > 0)
+    {
+        var current = queue.Dequeue();
+        if (!included.Add(current))
+        {
+            continue;
+        }
+        var references = stages[current].Instructions
+            .Select(i => Regex.Match(i, @"^(?:COPY\b.*?--from=|RUN\b.*?--mount=\S*?\bfrom=)([^\s,]+)", RegexOptions.IgnoreCase))
+            .Where(m => m.Success)
+            .Select(m => m.Groups[1].Value)
+            .Prepend(stages[current].Base);
+        foreach (var reference in references)
+        {
+            if (FindStage(reference) is int stage)
+            {
+                queue.Enqueue(stage);
+            }
+        }
+    }
+
+    return included.OrderBy(i => i).SelectMany(i => stages[i].Instructions).ToList();
+}
+
+static bool ReferencesTestPackage(XDocument doc) => doc.Descendants()
+    .Where(e => e.Name.LocalName == "PackageReference")
+    .Any(e => new[] { "Microsoft.NET.Test.Sdk", "xunit", "xunit.v3", "NUnit", "MSTest", "MSTest.TestFramework" }
+        .Contains((string?)e.Attribute("Include") ?? "", StringComparer.OrdinalIgnoreCase));
+
+static bool IsTestProject(string projectPath)
+{
+    try
+    {
+        var doc = XDocument.Load(projectPath);
+        var sdk = (string?)doc.Root?.Attribute("Sdk") ?? "";
+        var isTestProject = doc.Descendants()
+            .Where(e => e.Name.LocalName == "IsTestProject" &&
+                        e.AncestorsAndSelf().All(a => a.Attribute("Condition") == null && a.Name.LocalName is not ("When" or "Otherwise")))
+            .Any(e => e.Value.Trim().Equals("true", StringComparison.OrdinalIgnoreCase));
+        return isTestProject || ReferencesTestPackage(doc) || sdk.StartsWith("MSTest.Sdk", StringComparison.OrdinalIgnoreCase);
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+// The projects whose directories are not generated: test projects; projects nothing references that sit under
+// a Directory.Build.props configuring tests (which may make them test projects in a way this action cannot
+// evaluate); and projects that only those reference, such as shared test helpers. Deployables never are.
+// A library that only its tests still reference looks the same as a test helper, so an entry left behind for it
+// is kept on purpose: an extra trigger costs a build, while dropping a helper's entry would skip a test run.
+static HashSet<string> FindTestSide(List<string> allProjects, HashSet<string> testProjects, List<string> deployableProjects,
+    Dictionary<string, HashSet<string>> dependencyGraph, string repoRoot)
+{
+    var referencedBy = allProjects.ToDictionary(p => p, _ => new List<string>(), StringComparer.OrdinalIgnoreCase);
+    foreach (var (project, references) in dependencyGraph)
+    {
+        foreach (var reference in references)
+        {
+            if (referencedBy.TryGetValue(reference, out var list))
+            {
+                list.Add(project);
+            }
+        }
+    }
+
+    bool PropsConfigureTests(string project)
+    {
+        try
+        {
+            var props = FindFileInHierarchy(Path.GetDirectoryName(project)!, "Directory.Build.props", repoRoot);
+            if (props == null)
+            {
+                return false;
+            }
+            var doc = XDocument.Load(props);
+            return ReferencesTestPackage(doc) || doc.Descendants().Any(e => e.Name.LocalName == "IsTestProject");
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    var deployables = deployableProjects.ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var testSide = allProjects
+        .Where(p => !deployables.Contains(p) && (testProjects.Contains(p) || (referencedBy[p].Count == 0 && PropsConfigureTests(p))))
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    var changed = true;
+    while (changed)
+    {
+        changed = false;
+        foreach (var project in allProjects)
+        {
+            if (!deployables.Contains(project) && !testSide.Contains(project) &&
+                referencedBy[project].Count > 0 && referencedBy[project].All(testSide.Contains))
+            {
+                testSide.Add(project);
+                changed = true;
+            }
+        }
+    }
+    return testSide;
 }
 
 static HashSet<string> DetermineModifiedProjects(List<string> modifiedFiles, string repoRoot, List<string> allProjects)
@@ -331,56 +588,141 @@ static string? FindDockerfile(string startDir, string repoRoot)
     return null;
 }
 
-static string? FindWorkflowFile(string projectPath, string repoRoot)
+// Maps each workflow to the Dockerfile it builds, from its DOCKER_WORKING_DIRECTORY and
+// DOCKERFILE_RELATIVE_PATH (or the equivalent docker-working-directory/dockerfile-relative-path inputs).
+// A workflow whose values cannot be read, or that names a Dockerfile that does not exist, is left out.
+static Dictionary<string, string> FindWorkflowDockerfiles(string repoRoot)
+{
+    var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var workflow in GetWorkflowFiles(repoRoot))
+    {
+        var content = StripYamlComments(File.ReadAllText(workflow));
+        var (hasWorkingDirectory, workingDirectory) = ReadWorkflowValue(content, "DOCKER_WORKING_DIRECTORY", "docker-working-directory");
+        var (_, dockerfileRelativePath) = ReadWorkflowValue(content, "DOCKERFILE_RELATIVE_PATH", "dockerfile-relative-path");
+        if (dockerfileRelativePath == null || (hasWorkingDirectory && workingDirectory == null))
+        {
+            continue;
+        }
+
+        var dockerfile = Path.GetFullPath(Path.Combine(repoRoot, workingDirectory ?? ".", dockerfileRelativePath));
+        if (File.Exists(dockerfile))
+        {
+            result[workflow] = dockerfile;
+        }
+    }
+    return result;
+}
+
+// Whether the key is present, and its value when it is a plain literal (not an expression).
+static (bool Present, string? Value) ReadWorkflowValue(string content, params string[] keys)
+{
+    foreach (var key in keys)
+    {
+        var match = Regex.Match(content, $@"^\s*{Regex.Escape(key)}:[ \t]*(.*)$", RegexOptions.Multiline);
+        if (!match.Success)
+        {
+            continue;
+        }
+
+        var value = match.Groups[1].Value.Trim();
+        if (value.StartsWith("\"") || value.StartsWith("'"))
+        {
+            var close = value.IndexOf(value[0], 1);
+            value = close > 0 ? value.Substring(1, close - 1) : "";
+        }
+        else
+        {
+            var comment = Regex.Match(value, @"\s#");
+            value = (comment.Success ? value.Substring(0, comment.Index) : value).Trim();
+        }
+
+        return (true, value.Length == 0 || value.Contains("${{") ? null : value);
+    }
+    return (false, null);
+}
+
+// Gives every workflow that builds a deployable's Dockerfile that deployable as its owner. A Dockerfile whose
+// image publishes several projects leaves its workflows unowned, because which one a workflow is for cannot be
+// told from the workflow.
+static Dictionary<string, string?> AssignWorkflowOwners(Dictionary<string, string> workflowDockerfiles,
+    Dictionary<string, string> deployableDockerfiles, string repoRoot)
+{
+    var owners = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+    foreach (var (workflow, dockerfile) in workflowDockerfiles)
+    {
+        var candidates = deployableDockerfiles
+            .Where(d => d.Value.Equals(dockerfile, StringComparison.OrdinalIgnoreCase))
+            .Select(d => d.Key)
+            .ToList();
+        if (candidates.Count == 1)
+        {
+            owners[workflow] = candidates[0];
+        }
+        else if (candidates.Count > 1)
+        {
+            owners[workflow] = null;
+            Console.WriteLine($"::warning::{GetRelativePath(repoRoot, workflow)} builds a Dockerfile whose image publishes several projects; its path filters are not updated");
+        }
+    }
+    return owners;
+}
+
+static IEnumerable<string> GetWorkflowFiles(string repoRoot)
 {
     var workflowDir = Path.Combine(repoRoot, ".github", "workflows");
     if (!Directory.Exists(workflowDir))
     {
-        return null;
+        return Array.Empty<string>();
+    }
+    return Directory.GetFiles(workflowDir, "*.yml").Concat(Directory.GetFiles(workflowDir, "*.yaml")).OrderBy(w => w);
+}
+
+static string StripYamlComments(string content) =>
+    string.Join("\n", content.Split('\n').Where(line => !line.TrimStart().StartsWith("#")));
+
+static List<string> FindWorkflowFiles(string projectPath, Dictionary<string, string?> workflowOwners, string repoRoot)
+{
+    // A workflow that builds a deployable's Dockerfile belongs to its owner alone.
+    var owned = workflowOwners
+        .Where(w => w.Value != null && w.Value.Equals(projectPath, StringComparison.OrdinalIgnoreCase))
+        .Select(w => w.Key)
+        .ToList();
+    if (owned.Count > 0)
+    {
+        return owned;
     }
 
+    // Otherwise fall back to the workflow that mentions the project most specifically.
+    var best = GetWorkflowFiles(repoRoot)
+        .Where(w => !workflowOwners.ContainsKey(w))
+        .Select(w => (workflow: w, score: ScoreWorkflowMention(projectPath, StripYamlComments(File.ReadAllText(w)), repoRoot)))
+        .Where(m => m.score > 0)
+        .OrderByDescending(m => m.score)
+        .FirstOrDefault()
+        .workflow;
+    return best == null ? new List<string>() : new List<string> { best };
+}
+
+static int ScoreWorkflowMention(string projectPath, string content, string repoRoot)
+{
     var projectName = Path.GetFileNameWithoutExtension(projectPath);
     var projectRelativePath = GetRelativePath(repoRoot, projectPath).Replace("\\", "/");
     var projectDir = Path.GetDirectoryName(projectRelativePath)?.Replace("\\", "/") ?? "";
 
-    // Collect all potential matches with their specificity score
-    var matches = new List<(string workflow, int score)>();
-
-    foreach (var workflow in Directory.GetFiles(workflowDir, "*.yml").Concat(Directory.GetFiles(workflowDir, "*.yaml")))
+    // Highest priority: exact project path match
+    if (content.Contains(projectRelativePath))
     {
-        var content = File.ReadAllText(workflow);
-        var score = 0;
-
-        // Highest priority: exact project path match
-        if (content.Contains(projectRelativePath))
-        {
-            score = 100;
-        }
-        // High priority: project directory path match (e.g., "src/Likvido.CampaignRunnerScheduler/")
-        else if (!string.IsNullOrEmpty(projectDir) && content.Contains(projectDir + "/"))
-        {
-            score = 90;
-        }
-        // Medium priority: project name with word boundary (not a substring of another name)
-        // Use regex to ensure the project name is not part of a longer name
-        else
-        {
-            // Match projectName followed by non-alphanumeric or end (to avoid CampaignRunner matching CampaignRunnerScheduler)
-            var exactNamePattern = new Regex($@"{Regex.Escape(projectName)}(?![A-Za-z0-9])", RegexOptions.IgnoreCase);
-            if (exactNamePattern.IsMatch(content))
-            {
-                score = 50;
-            }
-        }
-
-        if (score > 0)
-        {
-            matches.Add((workflow, score));
-        }
+        return 100;
     }
-
-    // Return the best match (highest score)
-    return matches.OrderByDescending(m => m.score).FirstOrDefault().workflow;
+    // High priority: project directory path match (e.g., "src/Likvido.CampaignRunnerScheduler/")
+    if (!string.IsNullOrEmpty(projectDir) && content.Contains(projectDir + "/"))
+    {
+        return 90;
+    }
+    // Medium priority: project name not followed by more name characters (so CampaignRunner does not
+    // match CampaignRunnerScheduler)
+    var exactNamePattern = new Regex($@"{Regex.Escape(projectName)}(?![A-Za-z0-9])", RegexOptions.IgnoreCase);
+    return exactNamePattern.IsMatch(content) ? 50 : 0;
 }
 
 static string? FindFileInHierarchy(string startDir, string fileName, string repoRoot)
@@ -716,6 +1058,12 @@ static (bool Success, string Message) UpdateDockerfileWithoutMarkers(string dock
     }
     copyBlockStart++; // Adjust back to first COPY line
 
+    // Comments and blank lines above the first COPY line are not part of the block.
+    while (copyBlockStart <= copyBlockEnd && !lines[copyBlockStart].Trim().StartsWith("COPY", StringComparison.OrdinalIgnoreCase))
+    {
+        copyBlockStart++;
+    }
+
     if (copyBlockStart > copyBlockEnd)
     {
         return (false, "Could not identify COPY block for project files. Please add markers manually.");
@@ -737,8 +1085,8 @@ static (bool Success, string Message) UpdateDockerfileWithoutMarkers(string dock
         newLines.Add(copyLine);
     }
 
-    // Add lines after the COPY block (from restoreLineIndex onwards)
-    for (int i = restoreLineIndex; i < lines.Count; i++)
+    // Add lines after the COPY block, including any comments between it and the restore line
+    for (int i = copyBlockEnd + 1; i < lines.Count; i++)
     {
         newLines.Add(lines[i]);
     }
@@ -750,7 +1098,7 @@ static (bool Success, string Message) UpdateDockerfileWithoutMarkers(string dock
 }
 
 static (bool Success, string Message) UpdateWorkflow(string workflowPath, string projectPath, HashSet<string> dependencies,
-    string? directoryBuildProps, string? directoryPackagesProps, string repoRoot)
+    string? directoryBuildProps, string? directoryPackagesProps, string repoRoot, HashSet<string> generatedEntries)
 {
     var content = File.ReadAllText(workflowPath);
     var beginMarker = "# BEGIN AUTO-GENERATED PATHS";
@@ -842,7 +1190,7 @@ static (bool Success, string Message) UpdateWorkflow(string workflowPath, string
     }
 
     // Strategy 2: Find and replace paths: sections without markers
-    var result = UpdateWorkflowWithoutMarkers(workflowPath, content, uniquePaths, individualFiles, workflowRelativePath);
+    var result = UpdateWorkflowWithoutMarkers(workflowPath, content, uniquePaths, individualFiles, workflowRelativePath, generatedEntries, repoRoot);
     if (result.Success)
     {
         return (true, "Updated using pattern detection (no markers)");
@@ -851,95 +1199,153 @@ static (bool Success, string Message) UpdateWorkflow(string workflowPath, string
     return (false, result.Message);
 }
 
-static (bool Success, string Message) UpdateWorkflowWithoutMarkers(string workflowPath, string content, HashSet<string> uniquePaths, HashSet<string> individualFiles, string workflowRelativePath)
+// Updates every paths: list under a push, pull_request or pull_request_target trigger. Only the entries this action generates are
+// replaced: project directories, Directory.Build.props, Directory.Packages.props and the workflow file. Every
+// other entry and comment was written by hand and is kept where it is.
+static (bool Success, string Message) UpdateWorkflowWithoutMarkers(string workflowPath, string content, HashSet<string> uniquePaths,
+    HashSet<string> individualFiles, string workflowRelativePath, HashSet<string> generatedEntries, string repoRoot)
 {
-    var lines = content.Split('\n').ToList();
-    var modified = false;
+    bool IsGenerated(string entry) => IsGeneratedPathEntry(entry, generatedEntries, individualFiles, workflowRelativePath, repoRoot);
 
-    // Find all "paths:" lines and replace their content
+    var lines = content.Split('\n').ToList();
+    var found = false;
+
     for (int i = 0; i < lines.Count; i++)
     {
         var line = lines[i];
-        var trimmedLine = line.TrimEnd();
-
-        // Check if this line is "paths:" (with optional leading whitespace)
-        if (trimmedLine.TrimStart().Equals("paths:", StringComparison.OrdinalIgnoreCase) ||
-            trimmedLine.TrimStart().StartsWith("paths:", StringComparison.OrdinalIgnoreCase))
+        var trimmed = line.Trim();
+        if (!Regex.IsMatch(trimmed, @"^paths:\s*(#.*)?$"))
         {
-            // Get the indentation of the "paths:" line
-            var pathsIndent = line.Length - line.TrimStart().Length;
+            continue;
+        }
 
-            // Find the end of the paths array (next line with same or less indentation that isn't a list item or empty)
-            var pathsStart = i + 1;
-            var pathsEnd = pathsStart;
+        var pathsIndent = line.Length - line.TrimStart().Length;
+        var trigger = FindParentKey(lines, i, pathsIndent);
+        if (trigger is not ("push" or "pull_request" or "pull_request_target"))
+        {
+            continue;
+        }
 
-            while (pathsEnd < lines.Count)
+        // The list runs until the first non-blank, non-comment line that is not a list item.
+        var listStart = i + 1;
+        var listEnd = listStart;
+        while (listEnd < lines.Count)
+        {
+            var next = lines[listEnd].TrimStart();
+            if (next.Length == 0 || next.StartsWith("#") || next.StartsWith("-"))
             {
-                var nextLine = lines[pathsEnd];
-                var nextTrimmed = nextLine.TrimStart();
-
-                // Empty line - continue
-                if (string.IsNullOrWhiteSpace(nextLine))
-                {
-                    pathsEnd++;
-                    continue;
-                }
-
-                // Comment line within paths - continue
-                if (nextTrimmed.StartsWith("#"))
-                {
-                    pathsEnd++;
-                    continue;
-                }
-
-                // List item (starts with -) - this is part of paths array
-                if (nextTrimmed.StartsWith("-"))
-                {
-                    pathsEnd++;
-                    continue;
-                }
-
-                // Check indentation - if same or less than paths:, we've exited the array
-                var nextIndent = nextLine.Length - nextLine.TrimStart().Length;
-                if (nextIndent <= pathsIndent)
-                {
-                    break;
-                }
-
-                pathsEnd++;
+                listEnd++;
+                continue;
             }
+            break;
+        }
 
-            // Only proceed if we found some paths entries
-            if (pathsEnd > pathsStart)
+        var items = lines.GetRange(listStart, listEnd - listStart);
+        var firstItem = items.FirstOrDefault(l => l.TrimStart().StartsWith("-"));
+        if (firstItem == null)
+        {
+            continue;
+        }
+        found = true;
+
+        var itemIndent = new string(' ', firstItem.Length - firstItem.TrimStart().Length);
+        var handWritten = items
+            .Where(l => l.TrimStart().StartsWith("-"))
+            .Select(ParsePathEntry)
+            .Where(entry => !IsGenerated(entry))
+            .ToList();
+
+        // Directories the hand-written entries already include, such as "src/**", are not added.
+        var wantedDirs = uniquePaths
+            .Select(path => path + "/**")
+            .Where(entry => !HandWrittenIncludes(handWritten, entry.Substring(0, entry.Length - 3)))
+            .ToHashSet(StringComparer.Ordinal);
+        var wantedFiles = individualFiles.Append(workflowRelativePath).ToHashSet(StringComparer.Ordinal);
+
+        // Reconcile in place: generated entries still wanted keep their line, unwanted or duplicate ones are
+        // dropped, and hand-written entries and comments are untouched.
+        var newItems = new List<string>();
+        var present = new HashSet<string>(StringComparer.Ordinal);
+        var firstGeneratedIndex = -1;
+        for (int index = 0; index < items.Count; index++)
+        {
+            var item = items[index];
+            if (item.TrimStart().StartsWith("-"))
             {
-                // Determine the indentation for list items (typically 2 more than paths:)
-                var itemIndent = new string(' ', pathsIndent + 2);
-
-                // Build new paths entries
-                var newPathLines = new List<string>();
-                foreach (var path in uniquePaths.OrderBy(p => p))
+                var entry = ParsePathEntry(item);
+                if (IsGenerated(entry))
                 {
-                    newPathLines.Add($"{itemIndent}- \"{path}/**\"");
+                    if (firstGeneratedIndex == -1)
+                    {
+                        firstGeneratedIndex = newItems.Count;
+                    }
+                    if (!(wantedDirs.Contains(entry) || wantedFiles.Contains(entry)) ||
+                        LastExcludingNegation(items, entry) > index ||
+                        !present.Add(entry))
+                    {
+                        continue;
+                    }
                 }
-                // Add individual files (Directory.Build.props, Directory.Packages.props)
-                foreach (var file in individualFiles.OrderBy(f => f))
-                {
-                    newPathLines.Add($"{itemIndent}- \"{file}\"");
-                }
-                newPathLines.Add($"{itemIndent}- \"{workflowRelativePath}\"");
+            }
+            newItems.Add(item);
+        }
 
-                // Replace the old paths entries with new ones
-                lines.RemoveRange(pathsStart, pathsEnd - pathsStart);
-                lines.InsertRange(pathsStart, newPathLines);
-
-                // Adjust index since we modified the list
-                i = pathsStart + newPathLines.Count - 1;
-                modified = true;
+        // Missing directories go in sorted position among the generated directories, missing files after them.
+        // Same order as the generated list: the directory names, compared without the trailing "/**".
+        var missing = wantedDirs.OrderBy(d => d.Substring(0, d.Length - 3)).Where(d => !present.Contains(d)).ToList();
+        foreach (var file in individualFiles.OrderBy(f => f).Append(workflowRelativePath))
+        {
+            if (!present.Contains(file))
+            {
+                missing.Add(file);
             }
         }
+        foreach (var entry in missing)
+        {
+            var newLine = $"{itemIndent}- \"{entry}\"";
+            var isDir = wantedDirs.Contains(entry);
+            var generatedIndexes = Enumerable.Range(0, newItems.Count)
+                .Where(k => newItems[k].TrimStart().StartsWith("-") &&
+                            IsGenerated(ParsePathEntry(newItems[k])))
+                .ToList();
+            var dirIndexes = generatedIndexes.Where(k => !wantedFiles.Contains(ParsePathEntry(newItems[k]))).ToList();
+
+            int insertAt;
+            if (isDir && dirIndexes.Count > 0)
+            {
+                // Right after the last generated directory that sorts before it, or before the first one.
+                var dirName = entry.Substring(0, entry.Length - 3);
+                var before = dirIndexes.Where(k =>
+                {
+                    var existing = ParsePathEntry(newItems[k]);
+                    return string.Compare(existing.Substring(0, existing.Length - 3), dirName) < 0;
+                }).ToList();
+                insertAt = before.Count > 0 ? before.Last() + 1 : dirIndexes.First();
+            }
+            else if (!isDir && generatedIndexes.Count > 0)
+            {
+                insertAt = generatedIndexes.Last() + 1;
+            }
+            else if (generatedIndexes.Count > 0)
+            {
+                insertAt = generatedIndexes.First();
+            }
+            else
+            {
+                insertAt = firstGeneratedIndex >= 0 ? Math.Min(firstGeneratedIndex, newItems.Count)
+                    : newItems.FindIndex(l => l.TrimStart().StartsWith("-"));
+            }
+            // Below any hand-written "!" pattern that excludes it, as GitHub lets the last matching pattern decide.
+            insertAt = Math.Max(insertAt, LastExcludingNegation(newItems, entry) + 1);
+            newItems.Insert(insertAt, newLine);
+        }
+
+        lines.RemoveRange(listStart, items.Count);
+        lines.InsertRange(listStart, newItems);
+        i = listStart + newItems.Count - 1;
     }
 
-    if (!modified)
+    if (!found)
     {
         return (false, "Could not find 'paths:' sections in workflow file. Please add markers manually:\n" +
                       "    # BEGIN AUTO-GENERATED PATHS\n" +
@@ -947,9 +1353,170 @@ static (bool Success, string Message) UpdateWorkflowWithoutMarkers(string workfl
     }
 
     var newContent = string.Join("\n", lines);
-    File.WriteAllText(workflowPath, newContent);
+    if (newContent != content)
+    {
+        File.WriteAllText(workflowPath, newContent);
+    }
 
     return (true, "");
+}
+
+// The key of the nearest enclosing mapping, e.g. "push" for a paths: list nested under push:.
+static string? FindParentKey(List<string> lines, int index, int indent)
+{
+    for (int j = index - 1; j >= 0; j--)
+    {
+        var candidate = lines[j];
+        var trimmed = candidate.TrimStart();
+        if (trimmed.Length == 0 || trimmed.StartsWith("#"))
+        {
+            continue;
+        }
+        if (candidate.Length - trimmed.Length < indent)
+        {
+            var match = Regex.Match(trimmed, @"^['""]?([A-Za-z_][A-Za-z0-9_-]*)['""]?:");
+            return match.Success ? match.Groups[1].Value : null;
+        }
+    }
+    return null;
+}
+
+// The path in a "- \"src/Foo/**\"  # comment" list item.
+static string ParsePathEntry(string line)
+{
+    var value = line.TrimStart().Substring(1).Trim();
+    if (value.StartsWith("\"") || value.StartsWith("'"))
+    {
+        var quote = value[0];
+        var close = value.IndexOf(quote, 1);
+        return close > 0 ? value.Substring(1, close - 1) : value.Trim(quote);
+    }
+    var comment = value.IndexOf(" #");
+    return (comment >= 0 ? value.Substring(0, comment) : value).Trim();
+}
+
+// An entry this action owns: the workflow file, a project directory, one of this deployable's props files, or a
+// stale entry for a directory or props file that no longer exists (a renamed or deleted project). Paths are
+// compared case-sensitively, as GitHub matches them.
+static bool IsGeneratedPathEntry(string entry, HashSet<string> generatedEntries, HashSet<string> propsFiles,
+    string workflowRelativePath, string repoRoot)
+{
+    if (entry == workflowRelativePath || generatedEntries.Contains(entry) || propsFiles.Contains(entry, StringComparer.Ordinal))
+    {
+        return true;
+    }
+    // Any other glob was written by hand.
+    var isDirectoryEntry = entry.EndsWith("/**");
+    var path = isDirectoryEntry ? entry.Substring(0, entry.Length - 3) : entry;
+    if (path.IndexOfAny(new[] { '*', '?', '[', '!', '{' }) >= 0)
+    {
+        return false;
+    }
+    if (isDirectoryEntry)
+    {
+        return !PathExistsWithExactCase(repoRoot, path, directory: true);
+    }
+    var fileName = entry.Split('/').Last();
+    return (fileName == "Directory.Build.props" || fileName == "Directory.Packages.props") &&
+           !PathExistsWithExactCase(repoRoot, entry, directory: false);
+}
+
+static bool PathExistsWithExactCase(string repoRoot, string relativePath, bool directory)
+{
+    var current = repoRoot;
+    var segments = relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    for (int i = 0; i < segments.Length; i++)
+    {
+        if (segments[i] == ".")
+        {
+            continue;
+        }
+        if (segments[i] == ".." || !Directory.Exists(current))
+        {
+            return true; // Outside what this check can see; treat as present so the entry is kept.
+        }
+        var isLast = i == segments.Length - 1;
+        var candidates = isLast && !directory ? Directory.GetFiles(current) : Directory.GetDirectories(current);
+        var match = candidates.FirstOrDefault(c => Path.GetFileName(c) == segments[i]);
+        if (match == null)
+        {
+            return false;
+        }
+        current = match;
+    }
+    return true;
+}
+
+// Whether the hand-written patterns, applied in order as GitHub does, already include an ordinary file in the
+// directory: the last pattern matching it decides, and a "!" pattern excludes. So "src/**" covers src/Api, while
+// a later "!src/Tools/**" takes src/Tools/Shared out again. Patterns this check cannot read are ignored.
+static bool HandWrittenIncludes(List<string> patterns, string directory)
+{
+    bool Includes(string file)
+    {
+        var included = false;
+        foreach (var pattern in patterns)
+        {
+            var negated = pattern.StartsWith("!");
+            if (GlobToRegex(negated ? pattern.Substring(1) : pattern) is Regex regex && regex.IsMatch(file))
+            {
+                included = !negated;
+            }
+        }
+        return included;
+    }
+    return Includes(directory + "/file") && Includes(directory + "/sub/file");
+}
+
+// The index of the last "!" item in the list that excludes the file entry, or a file in the directory entry
+// ("X/**"), or -1.
+static int LastExcludingNegation(List<string> items, string pathEntry)
+{
+    var probes = pathEntry.EndsWith("/**")
+        ? new[] { pathEntry.Substring(0, pathEntry.Length - 3) + "/file", pathEntry.Substring(0, pathEntry.Length - 3) + "/sub/file" }
+        : new[] { pathEntry };
+    for (int k = items.Count - 1; k >= 0; k--)
+    {
+        if (!items[k].TrimStart().StartsWith("-"))
+        {
+            continue;
+        }
+        var entry = ParsePathEntry(items[k]);
+        if (entry.StartsWith("!") && GlobToRegex(entry.Substring(1)) is Regex regex && probes.Any(regex.IsMatch))
+        {
+            return k;
+        }
+    }
+    return -1;
+}
+
+// GitHub's path filter glob: ** matches across directories, * within one. Returns null for syntax this
+// check does not read ([ ] { } + ?, where GitHub's ? and + repeat the preceding character).
+static Regex? GlobToRegex(string glob)
+{
+    if (glob.IndexOfAny(new[] { '[', ']', '{', '}', '+', '?' }) >= 0)
+    {
+        return null;
+    }
+    var sb = new StringBuilder("^");
+    for (int i = 0; i < glob.Length; i++)
+    {
+        if (glob[i] == '*' && i + 1 < glob.Length && glob[i + 1] == '*')
+        {
+            var slashFollows = i + 2 < glob.Length && glob[i + 2] == '/';
+            sb.Append(slashFollows ? "(?:.*/)?" : ".*");
+            i += slashFollows ? 2 : 1;
+        }
+        else if (glob[i] == '*')
+        {
+            sb.Append("[^/]*");
+        }
+        else
+        {
+            sb.Append(Regex.Escape(glob[i].ToString()));
+        }
+    }
+    return new Regex(sb.Append('$').ToString());
 }
 
 static void SetGitHubOutputs(int dockerfilesUpdated, int workflowsUpdated, int totalDependencies)
@@ -1019,7 +1586,7 @@ Detection Modes:
   2. AUTOMATIC DETECTION (no markers needed):
      - Dockerfiles: Finds COPY statements for .csproj/.props files
        before 'RUN dotnet restore' and replaces them
-     - Workflows: Finds 'paths:' sections and replaces their contents
+     - Workflows: Finds 'paths:' sections and updates the generated entries, keeping hand-written ones
 
   The tool tries markers first, then falls back to automatic detection.
 ");
