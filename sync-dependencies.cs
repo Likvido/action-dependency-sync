@@ -250,15 +250,15 @@ static List<string> FindDeployableProjects(List<string> allProjects, string repo
 
 static bool RestoresWholeSolution(string dockerfilePath)
 {
-    var content = File.ReadAllText(dockerfilePath);
-    if (content.Contains("# BEGIN AUTO-GENERATED PROJECT REFERENCES"))
+    if (File.ReadAllText(dockerfilePath).Contains("# BEGIN AUTO-GENERATED PROJECT REFERENCES"))
     {
         return false;
     }
-    return content.Split('\n')
-        .Select(line => line.Trim())
-        .Any(line => line.StartsWith("RUN", StringComparison.OrdinalIgnoreCase) &&
-                     Regex.IsMatch(line, @"dotnet\s+restore\b[^\n]*\.slnx?\b", RegexOptions.IgnoreCase));
+    // The solution has to be an argument of the restore command itself, not of a later chained one.
+    return DockerfileInstructions(dockerfilePath)
+        .Where(instruction => Regex.IsMatch(instruction, @"^RUN\b", RegexOptions.IgnoreCase))
+        .Select(ShellCommandLine)
+        .Any(command => Regex.IsMatch(command, @"\bdotnet\s+restore\b[^;&|\n]*\.slnx?\b", RegexOptions.IgnoreCase));
 }
 
 // Whether the image the Dockerfile builds publishes the project: a "dotnet publish" naming the .csproj in the
@@ -271,12 +271,18 @@ static bool DockerfilePublishesProject(string dockerfilePath, string projectPath
         $@"\bdotnet\s+publish\b[^;&|\n]*?(?<![A-Za-z0-9_.-]){Regex.Escape(projectFileName)}(?![A-Za-z0-9_.-])",
         RegexOptions.IgnoreCase);
 
-    // An exec-form RUN ["dotnet", "publish", ...] is read as the command line it runs. A ; & or | inside quotes,
-    // as in -p:DefineConstants="A;B", does not end the shell command.
     return FinalImageInstructions(dockerfilePath)
-        .Select(instruction => ExecFormArguments(instruction) is { } arguments ? ExecFormCommandLine(arguments) : instruction)
-        .Select(instruction => Regex.Replace(instruction, @"""[^""]*""|'[^']*'", quoted => Regex.Replace(quoted.Value, "[;&|]", " ")))
+        .Select(ShellCommandLine)
         .Any(instruction => publishProjectPattern.IsMatch(instruction));
+}
+
+// The command line an instruction runs, ready to be split at shell separators. An exec-form RUN ["dotnet",
+// "publish", ...] is read as the command line it runs. A ; & or | inside quotes, as in -p:DefineConstants="A;B",
+// does not end the shell command.
+static string ShellCommandLine(string instruction)
+{
+    var commandLine = ExecFormArguments(instruction) is { } arguments ? ExecFormCommandLine(arguments) : instruction;
+    return Regex.Replace(commandLine, @"""[^""]*""|'[^']*'", quoted => Regex.Replace(quoted.Value, "[;&|]", " "));
 }
 
 // An exec-form RUN has no shell, so ; & | inside an argument are literal. A shell started in exec form
@@ -317,17 +323,42 @@ static List<string>? ExecFormArguments(string instruction)
     }
 }
 
-static List<string> FinalImageInstructions(string dockerfilePath)
+// The Dockerfile's instructions, one per line. Comment lines are dropped first, as Docker does, then
+// continuation lines are joined so an instruction split over several lines is one line. The continuation
+// character is "\", or the one a "# escape=" parser directive at the top of the file sets (often "`" on
+// Windows). Heredoc bodies stay as separate lines.
+static List<string> DockerfileInstructions(string dockerfilePath)
 {
-    // Drop comment lines first, as Docker does, then join "\" continuation lines so an instruction split over
-    // several lines is one line. Heredoc bodies stay as separate lines in their stage.
-    var withoutComments = string.Join("\n", File.ReadAllText(dockerfilePath).Split('\n')
-        .Where(line => !line.TrimStart().StartsWith("#")));
-    var instructions = Regex.Replace(withoutComments, @"\\[ \t]*\r?\n", " ")
+    var lines = File.ReadAllText(dockerfilePath).Split('\n');
+    var escape = '\\';
+    foreach (var line in lines)
+    {
+        // Parser directives are "# key=value" comments before the first instruction or other comment. As in
+        // Docker, an unknown key or an empty value is a plain comment and ends the directives, and only ASCII
+        // whitespace may separate the parts.
+        var directive = Regex.Match(line, @"^\s*#[ \t\f\r]*([A-Za-z][A-Za-z0-9]*)[ \t\f\r]*=[ \t\f\r]*(.+?)[ \t\f\r]*$");
+        if (!directive.Success || directive.Groups[1].Value.ToLowerInvariant() is not ("syntax" or "escape" or "check"))
+        {
+            break;
+        }
+        if (directive.Groups[1].Value.Equals("escape", StringComparison.OrdinalIgnoreCase) &&
+            directive.Groups[2].Value is "`" or "\\")
+        {
+            escape = directive.Groups[2].Value[0];
+        }
+    }
+
+    var withoutComments = string.Join("\n", lines.Where(line => !line.TrimStart().StartsWith("#")));
+    return Regex.Replace(withoutComments, Regex.Escape(escape.ToString()) + @"[ \t]*\r?\n", " ")
         .Split('\n')
         .Select(line => line.Trim())
         .Where(line => line.Length > 0)
         .ToList();
+}
+
+static List<string> FinalImageInstructions(string dockerfilePath)
+{
+    var instructions = DockerfileInstructions(dockerfilePath);
 
     var stages = new List<(string? Name, string Base, List<string> Instructions)>();
     foreach (var instruction in instructions)
