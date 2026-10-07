@@ -43,8 +43,8 @@ The action supports two modes for detecting where to update files:
 
 The action can automatically find and replace the relevant sections:
 
-- **Dockerfiles**: Finds COPY statements for `.csproj`/`.props` files before `RUN dotnet restore` and replaces them
-- **Workflows**: Finds `paths:` sections under `push:` and `pull_request:` and replaces their contents
+- **Dockerfiles**: Finds COPY statements for `.csproj`/`.props` files before `RUN dotnet restore` and replaces them. Comments around the block are kept. A Dockerfile without markers that restores a whole solution (`dotnet restore My.sln`) is skipped, because that restore needs every project the solution names; add markers to have its COPY block generated anyway
+- **Workflows**: Finds `paths:` sections under `push:`, `pull_request:` and `pull_request_target:` and updates only the entries the action generates — the directories of the solution's projects other than test projects and the projects only they reference, the deployable's own `Directory.Build.props` and `Directory.Packages.props`, and the workflow file itself. An entry for a directory or props file that no longer exists (a renamed or deleted project) is removed too; paths are compared case-sensitively, as GitHub matches them. Every other entry (a `Dockerfile`, a `.sln`, `scripts/**`, a test project's directory, or a project only test projects reference) and every comment is left where it is. A library that only its tests still reference therefore keeps its entry until it is removed by hand. A generated directory the hand-written patterns already include, such as `src/**`, is not added; patterns are applied in order as GitHub does, so a later `!src/Tools/**` takes `src/Tools/...` out again and the directory is then added
 
 This works out of the box with standard Dockerfile and workflow structures.
 
@@ -146,7 +146,10 @@ jobs:
 ├─────────────────────────────────────────────────────────────────┤
 │ 2. Build complete dependency graph by parsing .csproj files     │
 ├─────────────────────────────────────────────────────────────────┤
-│ 3. Find all "deployable" projects (those with Dockerfiles)      │
+│ 3. Find all "deployable" projects                               │
+│    - A Dockerfile in the project's own directory, OR            │
+│    - A parent directory's Dockerfile whose image publishes it   │
+│    - Test projects are never deployable                         │
 ├─────────────────────────────────────────────────────────────────┤
 │ 4. Determine which projects were modified                       │
 │    - From --modified input, OR                                  │
@@ -158,6 +161,9 @@ jobs:
 │    - Deployables that transitively depend on modified projects  │
 ├─────────────────────────────────────────────────────────────────┤
 │ 6. Update Dockerfiles and workflows for affected projects       │
+│    - A workflow belongs to the Dockerfile its                   │
+│      DOCKER_WORKING_DIRECTORY + DOCKERFILE_RELATIVE_PATH name   │
+│    - Other workflows are matched by project path, dir or name   │
 │    - Uses markers if present                                    │
 │    - Falls back to pattern detection if no markers              │
 └─────────────────────────────────────────────────────────────────┘
@@ -324,7 +330,11 @@ The automatic Dockerfile detection looks for `RUN dotnet restore` to find the CO
 
 ### Warning: Could not find 'paths:' sections
 
-The automatic workflow detection looks for `paths:` under `push:` or `pull_request:`. If your workflow doesn't have path filters, add explicit markers or add a `paths:` section.
+The automatic workflow detection looks for `paths:` under `push:`, `pull_request:` or `pull_request_target:`. If your workflow doesn't have path filters, add explicit markers or add a `paths:` section.
+
+### A workflow is matched to the wrong project
+
+A workflow that sets `DOCKER_WORKING_DIRECTORY` and `DOCKERFILE_RELATIVE_PATH` (or the `docker-working-directory` and `dockerfile-relative-path` inputs) is updated only for the project that Dockerfile builds. A workflow whose Dockerfile builds no project in the solution, such as a frontend image, can still be matched by the fallback. Set both on any workflow that builds an image. Without them the action falls back to finding the project's path or name in the workflow, ignoring comment lines.
 
 ### Warning: Legacy .NET Framework project detected
 
@@ -340,7 +350,7 @@ Ensure your repository contains at least one `.sln or .slnx` file. The action us
 
 ### No deployable projects found
 
-The action looks for projects that have a `Dockerfile` in their directory or parent directories. Ensure your deployable projects have Dockerfiles.
+A project is deployable when its own directory has a `Dockerfile`, or when a `Dockerfile` in a parent directory runs `dotnet publish` on the project's `.csproj` in its final stage, or in a stage the final stage is built `FROM` or copies `--from`. A publish in any other stage, such as a test stage, does not count, because the deployment pipeline builds the final stage. Test projects are never deployable.
 
 ### Changes not detected
 
