@@ -4,7 +4,7 @@ author: 'Likvido'
 
 inputs:
   modified-files:
-    description: 'Comma-separated list of modified files. If not specified, will use git to detect changes or update all deployable projects.'
+    description: 'Comma- or newline-separated list of modified files. If not specified, will use git to detect changes or update all deployable projects.'
     required: false
     default: ''
   base-ref:
@@ -68,12 +68,28 @@ runs:
         # If modified files are provided, use them directly
         if [ -n "$INPUT_MODIFIED_FILES" ]; then
           echo "Using provided modified files list"
+          # Keep the list on one line: a line break would start another output
+          INPUT_MODIFIED_FILES="${INPUT_MODIFIED_FILES//$'\r'/}"
+          INPUT_MODIFIED_FILES="${INPUT_MODIFIED_FILES//$'\n'/,}"
           echo "modified_files=$INPUT_MODIFIED_FILES" >> $GITHUB_OUTPUT
           exit 0
         fi
 
         # If base ref is provided, use git diff to detect changes
         if [ -n "$INPUT_BASE_REF" ]; then
+          # git would read a value starting with "-" as an option, not a ref, and a line break would let the
+          # log line below start a workflow command
+          case "$INPUT_BASE_REF" in
+            -*)
+              echo "::error::base-ref must be a branch, tag or commit, not a value starting with '-'"
+              exit 1
+              ;;
+            *$'\n'*|*$'\r'*)
+              echo "::error::base-ref must be a branch, tag or commit, not a value containing a line break"
+              exit 1
+              ;;
+          esac
+
           echo "Detecting modified files compared to $INPUT_BASE_REF"
 
           # Fetch the base ref if needed
@@ -112,17 +128,17 @@ runs:
           fi
         fi
 
-        # Build arguments
-        ARGS="--repo-root \"$REPO_ROOT\""
+        # Build arguments as an array, so file names are passed as plain arguments and never parsed by the shell
+        ARGS=(--repo-root "$REPO_ROOT")
 
         if [ -n "$MODIFIED_FILES" ]; then
-          ARGS="$ARGS --modified \"$MODIFIED_FILES\""
+          ARGS+=(--modified "$MODIFIED_FILES")
         fi
 
         # Run the sync script
         echo "::group::Syncing dependencies"
         cd "${{ github.action_path }}"
-        eval dotnet run sync-dependencies.cs -- $ARGS
+        dotnet run sync-dependencies.cs -- "${ARGS[@]}"
         SYNC_EXIT_CODE=$?
         echo "::endgroup::"
 

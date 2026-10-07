@@ -173,7 +173,7 @@ jobs:
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `modified-files` | Comma-separated list of modified files | No | Auto-detect |
+| `modified-files` | Comma- or newline-separated list of modified files | No | Auto-detect |
 | `base-ref` | Git ref to compare against (e.g., `origin/main`) | No | - |
 | `repository-root` | Root directory of the repository | No | `GITHUB_WORKSPACE` |
 
@@ -211,6 +211,7 @@ Useful when integrating with other actions that detect file changes:
   id: changed
   uses: tj-actions/changed-files@v44
   with:
+    separator: ","
     files: |
       **/*.csproj
       **/Directory.Build.props
